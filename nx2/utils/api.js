@@ -1,6 +1,6 @@
 /* eslint-disable no-use-before-define */
 import {
-  HLX_ADMIN, AEM_API, DA_ADMIN, ALLOWED_TOKEN, sheet2object, object2sheet,
+  HLX_ADMIN, AEM_API, DA_ADMIN, DA_CONTENT, ALLOWED_TOKEN, sheet2object, object2sheet,
 } from './utils.js';
 
 export const { loadIms, handleSignIn } = await (async () => {
@@ -399,8 +399,46 @@ export const source = {
   copy: withArgs(async ({
     org, site, path, destination, collision,
   }) => {
-    const hlx6 = await isHlx6(org, site);
-    if (hlx6) {
+    const dest = fromPath(destination);
+    const sameSite = org === dest.org && site === dest.site;
+    const [srcHlx6, destHlx6] = await Promise.all([
+      isHlx6(org, site),
+      isHlx6(dest.org, dest.site),
+    ]);
+
+    // Server-side copy only works within a single site: the hlx6 source-bus PUT
+    // is scoped to one site (its `?source=` can't reference another), and the DA
+    // /copy endpoint is keyed to one org/site. So a cross-site copy that touches
+    // hlx6 — a different hlx6 site, or across the DA/hlx6 backends — can't use it;
+    // stream the bytes instead: read from the source, then `save` to the
+    // destination's source bus. This covers every tree file (docs and standalone
+    // assets like PDFs/images alike — all served from their source path); the
+    // `/media` content-addressed store is only for images embedded in documents,
+    // not standalone files. Folders aren't supported this way (the source GET has
+    // no file body) and fail non-ok. DA-to-DA cross-site keeps the server-side
+    // /copy.
+    if (!sameSite && (srcHlx6 || destHlx6)) {
+      const getResp = await source.get({ org, site, path });
+      if (!getResp.ok) return getResp;
+      let body;
+      if (findContentType(path) === 'text/html') {
+        // A doc's media_ references are relative, so they'd resolve against the
+        // destination site (where the asset doesn't exist) once saved. Rewrite
+        // them to absolute URLs on the source's content origin; the destination's
+        // POST ingestion then fetches and re-hosts them into its own media bus.
+        const srcBase = srcHlx6
+          ? `https://main--${site}--${org}.aem.page${path}`
+          : `${DA_CONTENT}/${org}/${site}${path}`;
+        body = absolutizeMediaRefs(await getResp.text(), srcBase);
+      } else {
+        body = await getResp.blob();
+      }
+      return source.save({
+        org: dest.org, site: dest.site, path: dest.path, body,
+      });
+    }
+
+    if (srcHlx6) {
       // 'destination' contains '/org/site/' prefix, which is needed for DA source
       // but not for the source bus
       const pfx = `/${org}/${site}/`;
@@ -423,10 +461,17 @@ export const source = {
   move: withArgs(async ({
     org, site, path, destination, collision,
   }) => {
-    const hlx6 = await isHlx6(org, site);
-    if (hlx6) {
-      // The source bus has no move operation; emulate it as a copy followed by a
-      // delete of the original. copy handles the hlx6 destination-prefix stripping.
+    const dest = fromPath(destination);
+    const [srcHlx6, destHlx6] = await Promise.all([
+      isHlx6(org, site),
+      isHlx6(dest.org, dest.site),
+    ]);
+    // The source bus has no move operation, and no server-side move spans two
+    // backends, so whenever hlx6 is involved emulate it as a copy followed by a
+    // delete of the original. copy handles the hlx6 destination-prefix stripping
+    // and the cross-backend byte stream. Fails safe: if the copy isn't ok, the
+    // original is never deleted.
+    if (srcHlx6 || destHlx6) {
       const copyResp = await source.copy({
         org, site, path, destination, collision,
       });
@@ -700,6 +745,29 @@ const TYPE_MAP = {
 function findContentType(path) {
   const ext = Object.keys(TYPE_MAP).find((e) => path.toLowerCase().endsWith(e));
   return TYPE_MAP[ext];
+}
+
+// Rewrite a doc's relative `media_` references (src/href/srcset) to absolute
+// URLs resolved against `base` (the source doc's content-origin URL). Used when
+// copying a doc to another site: relative refs would resolve against the
+// destination and 404, whereas absolute source URLs let the destination's
+// ingestion fetch and re-host the media. Non-`media_` links and already-absolute
+// URLs are left untouched.
+function absolutizeMediaRefs(html, base) {
+  const absolutize = (url) => {
+    const trimmed = url.trim();
+    if (!trimmed.includes('media_') || /^(https?:)?\/\//i.test(trimmed)) return url;
+    return new URL(trimmed, base).href;
+  };
+  return html.replace(/\b(src|href|srcset)=(["'])(.*?)\2/gi, (full, attr, quote, val) => {
+    const rewritten = attr.toLowerCase() === 'srcset'
+      ? val.split(',').map((part) => {
+        const [url, ...descriptor] = part.trim().split(/\s+/);
+        return [absolutize(url), ...descriptor].join(' ');
+      }).join(', ')
+      : absolutize(val);
+    return `${attr}=${quote}${rewritten}${quote}`;
+  });
 }
 
 // DA-owned endpoints proxied between DA_ADMIN and AEM_API.
